@@ -133,9 +133,9 @@ This creates a **hybrid runtime** where Unity logic remains C#-driven, while rel
 
 ---
 
-## 2) POST-UNINSTALLATION DAMAGE ("LINGERING DAMAGE" REPORT)
+## 2. POST-UNINSTALLATION DAMAGE ("LINGERING DAMAGE" REPORT)
 
-## 2.1 Savegame corruption and post-uninstall crash risk
+### 2.1 Savegame corruption and post-uninstall crash risk
 
 ### Observed behavior
 - Multiplayer join/save-sync flow can:
@@ -158,7 +158,7 @@ This creates a **hybrid runtime** where Unity logic remains C#-driven, while rel
 
 ---
 
-## 2.2 Permanent asset modification of base game files
+### 2.2 Permanent asset modification of base game files
 
 ### Checked concern
 Whether runtime code overwrites:
@@ -178,7 +178,7 @@ Whether runtime code overwrites:
 
 ---
 
-## 2.3 Orphaned configuration / registry / environment persistence
+### 2.3 Orphaned configuration / registry / environment persistence
 
 ### Findings
 - Mod config JSON persists in `UserData/ModConfigs`.
@@ -196,9 +196,9 @@ Whether runtime code overwrites:
 
 ---
 
-## 3) ADDITIONAL SEVERE RISKS
+## 3. ADDITIONAL SEVERE RISKS
 
-## 3.1 Hidden malicious behavior (exfiltration / RCE)
+### 3.1 Hidden malicious behavior (exfiltration / RCE)
 
 ### Exfiltration
 - Network traffic exists and is expected for multiplayer relay.
@@ -214,7 +214,7 @@ Whether runtime code overwrites:
 
 ---
 
-## 3.2 Transport and trust risks
+### 3.2 Transport and trust risks
 
 - Default relay URL uses **unencrypted `ws://`**.
 - Risks:
@@ -226,7 +226,7 @@ Whether runtime code overwrites:
 
 ---
 
-## 3.3 FFI/system-level vulnerability surface
+### 3.3 FFI/system-level vulnerability surface
 
 - Native DLL loading from `Mods/native` implies trust in every loaded module.
 - Rust FFI methods include baseline pointer/size guards, but:
@@ -240,7 +240,7 @@ Whether runtime code overwrites:
 
 ## Conclusive Risk Assessment
 
-## Final rating: **MEDIUM**
+### Final rating: **MEDIUM**
 
 ### Why not LOW
 - Save overwrite/restore timing can leave broken saves after uninstall.
