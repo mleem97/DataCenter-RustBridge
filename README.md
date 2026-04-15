@@ -189,6 +189,20 @@ Game (Data Center — Unity 6, IL2CPP)
 | [Multiplayer Roadmap](docs/multiplayer_roadmap.md) | Design doc and roadmap for the multiplayer mod |
 | [Security & Stability Report](docs/security_stability_report.md) | Security and stability analysis of the C#/Rust bridge and runtime behavior |
 
+## Troubleshooting
+
+### Il2CppAssemblyGenerator `NullReferenceException` after game version/engine change
+
+If you switched to a different Data Center build (or Unity/IL2CPP metadata changed), cached MelonLoader interop output may no longer match.
+
+1. Close the game.
+2. Delete:
+   - `MelonLoader/Il2CppAssemblies/`
+   - `MelonLoader/Il2CppAssemblyGenerator/`
+   - `MelonLoader/Dependencies/Il2CppAssemblyGenerator/Cpp2IL/cpp2il_out/` (if present)
+3. Reinstall/repair MelonLoader `v0.7.2` for the current game build.
+4. Start once without extra mods to let interop assemblies regenerate.
+
 ## License
 
 MIT
