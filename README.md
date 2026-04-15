@@ -187,6 +187,7 @@ Game (Data Center — Unity 6, IL2CPP)
 | [Mod Config System](docs/mod_config_system.md) | Developer guide for registering and using mod settings from C# mods |
 | [Game API Reference](docs/game_api_reference.md) | Il2Cpp API reference for game classes (Server, Technician, PlayerManager, etc.) |
 | [Multiplayer Roadmap](docs/multiplayer_roadmap.md) | Design doc and roadmap for the multiplayer mod |
+| [Security & Stability Report](docs/security_stability_report.md) | Security and stability analysis of the C#/Rust bridge and runtime behavior |
 
 ## License
 
