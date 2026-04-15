@@ -193,7 +193,7 @@ Game (Data Center — Unity 6, IL2CPP)
 
 ### Il2CppAssemblyGenerator `NullReferenceException` after game version/engine change
 
-If you switched to a different Data Center build (or Unity/IL2CPP metadata changed), cached MelonLoader interop output may no longer match.
+If you switched to a different Data Center build (or Unity/Il2Cpp metadata changed), cached MelonLoader interop output may no longer match.
 
 1. Close the game.
 2. Delete:
