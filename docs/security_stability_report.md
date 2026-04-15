@@ -1,97 +1,279 @@
-# Sicherheits- und Stabilitätsbericht (C#/Rust Bridge)
+# Security & Stability Deep-Dive Audit (Unity MelonLoader C#/Rust Bridge)
 
-## ZUSAMMENFASSUNG DER GEFAHREN (Risk-Level: **Mittel**)
+## Executive Conclusion
 
-Gesamtbewertung: **Mittel**.
+**Overall risk level: MEDIUM (stability-heavy, not malware-heavy).**
 
-Hauptgründe:
-- Keine klaren Malware-Indikatoren wie Shell-Exec (`Process.Start` / `std::process::Command`) im Runtime-Code.
-- Netzwerkverkehr ist vorhanden (Relay via WebSocket), aber sichtbar und funktional begründet.
-- Relevantes Persistenz-/Integritätsrisiko durch Multiplayer-Save-Handling (temporäres Überschreiben lokaler Saves mit Backup-Mechanik).
-- FFI und Threading sind grundsätzlich defensiv umgesetzt, bleiben aber naturgemäß crash-sensitiv bei fehlerhaften nativen Mod-DLLs.
+The audited codebase implements a runtime bridge between:
+- **C# (MelonLoader + Harmony in Unity IL2CPP)** and
+- **native Rust DLL modules** loaded at runtime via FFI.
 
-## BEFUND: PERSISTENZ & DATEISYSTEM
+Primary findings:
+- No direct evidence of classic malware behavior (no runtime shell/process execution, no registry persistence logic, no base-game binary patching-on-disk in runtime code paths).
+- The largest practical risk is **save-state handling during multiplayer join/sync**, where existing save files can be temporarily overwritten and restored via backup logic.
+- The largest technical security weakness is **plaintext relay transport (`ws://`)** that permits on-path interception/manipulation.
+- FFI memory handling includes basic defensive checks, but native-module boundaries remain crash-sensitive by design.
 
-### Beobachtungen
-- Modloader-Logging in Game-Root:
-  - `csharp/DataCenterModLoader/Core.cs` schreibt `dc_modloader_debug.log` in `MelonEnvironment.GameRootDirectory`.
-- Mod-Konfiguration und Mod-Assets in UserData:
-  - `csharp/DataCenterModLoader/ModConfigSystem.cs` nutzt `MelonEnvironment.UserDataDirectory/ModConfigs`.
-  - `csharp/DataCenterModLoader/CustomEmployeeManager.cs` nutzt `MelonEnvironment.UserDataDirectory` für Status/Assets.
-- Savegame-Zugriffe im Multiplayer:
-  - `csharp/DataCenterModLoader/MultiplayerBridge.cs` nutzt `SaveSystem.saveDirPath` und als Fallback `Application.persistentDataPath`.
-  - Host-Join-Sync kann bestehende Save-Datei überschreiben (`WriteSaveToDisk`) und erstellt `.mp_backup`, `_mp_sync`.
-  - Cleanup versucht Rücksicherung (`CleanupMpSaveFiles`).
-- Rust-Mod `dc_netwatch` schreibt Portrait nach `.../UserData/ModAssets` relativ zu `current_exe`:
-  - `crates/dc_netwatch/src/lib.rs`.
+---
 
-### Bewertung
-- **Kein Hinweis auf Modifikation von Spiel-Binaries** (`.assets/.dll` des Spiels) im Runtime-Code.
-- **Persistenzrisiko vorhanden**: Save-Overwrite-Strategie kann bei Crash/Abbruch zwischen Write und Cleanup zu inkonsistentem lokalen Stand führen.
-- `Application.persistentDataPath` kann auf `%AppData%` zeigen (außerhalb des Installationsordners), ist für Unity-Saves aber üblich.
+## 1) COMPREHENSIVE COMPONENT BREAKDOWN
 
-## BEFUND: ENGINE-LOGIK & MEMORY (C#/Rust)
+### 1.1 High-level architecture and purpose
 
-### Harmony / Spiel-Logik
-- Viele Patches sind `Postfix`-basiert und event-orientiert (`HarmonyPatches.cs`), was das Risiko harter Logiküberschreibung reduziert.
-- Kritischer `Update`-Hook vorhanden:
-  - `[HarmonyPatch(typeof(TimeController), "Update")]` als `Postfix`.
-- Zwei `Prefix`-Patches können Originalmethoden gezielt unterdrücken (`return false`):
+This project is a **mod runtime framework** for Data Center:
+
+- **C# side (`csharp/DataCenterModLoader/`)**
+  - Boots as a MelonLoader mod (`Core.cs`)
+  - Applies Harmony patches into game methods
+  - Loads and hosts native Rust mods (`FFIBridge.cs`)
+  - Exposes game APIs to Rust (`GameAPI.cs`)
+  - Handles multiplayer relay/session/save workflows (`MultiplayerBridge.cs`)
+  - Maintains mod configs and custom content integration
+
+- **Rust side (`crates/`)**
+  - `dc_api`: shared API contracts and utility abstractions
+  - `dc_multiplayer`: networking/session/save-sync logic, FFI exports consumed by C#
+  - `dc_netwatch`: example gameplay mod (SysAdmin automation) using the API
+  - `dc_relay_proto`: packet/protocol codec layer
+
+**Actual purpose of the code:**  
+Enable feature-rich game modding with native Rust extensions and optional multiplayer state synchronization, while preserving single-player gameplay hooks.
+
+---
+
+### 1.2 C# runtime flow (MelonLoader / Unity side)
+
+#### `Core.cs`
+- Entry point (`MelonMod`) initializes:
+  - Crash/file logging in game root (`dc_modloader_debug.log`)
+  - `Mods/native` directory
+  - Harmony patches (`HarmonyInstance.PatchAll`)
+  - ModConfig system
+  - FFI bridge for Rust mod loading
+- Runs periodic update pipelines and shutdown cleanup.
+
+#### `FFIBridge.cs` (generic Rust mod host)
+- Enumerates `Mods/native/*.dll`.
+- Uses Win32 dynamic loading APIs:
+  - `LoadLibrary`, `GetProcAddress`, `FreeLibrary`
+- Resolves exports:
+  - Required/optional (`mod_info`, `mod_init`, `mod_update`, `mod_fixed_update`, `mod_on_scene_loaded`, `mod_shutdown`, `mod_on_event`)
+- Marshals C# strings to native pointers and frees allocated memory (`StringToHGlobalAnsi` / `FreeHGlobal`).
+- Isolates per-mod callback failures with try/catch logging to reduce hard-fail cascades.
+
+#### `HarmonyPatches.cs` + `GameHooks.cs`
+- Extensive game method interception, mostly **Postfix** notification style.
+- A few **Prefix** patches can suppress original behavior in specific conditions:
   - `HRSystem.ButtonConfirmHire`
   - `HRSystem.ButtonConfirmFireEmployee`
-  - Unterdrückung ist an `CustomEmployeeManager`-Bedingung gebunden.
+- Includes high-frequency hook on `TimeController.Update`, so performance and exception resilience matter.
 
-### FFI / Memory
-- C#-Bridge lädt native DLLs via `LoadLibrary/GetProcAddress` (`FFIBridge.cs`).
-- String-Marshalling (`Marshal.StringToHGlobalAnsi`) wird freigegeben (`FreeHGlobal`) — korrekt.
-- Rust-FFI in `crates/dc_multiplayer/src/ffi/save.rs`:
-  - Null-/Längenchecks vorhanden.
-  - `copy_nonoverlapping` mit begrenzter Länge (`min(data.len(), max_len)`) reduziert Overflow-Risiko.
-- Generell bleibt: Absturzpotenzial besteht bei fehlerhaften externen nativen Mod-DLLs (typisch für FFI-Ökosysteme).
+#### `MultiplayerBridge.cs` (C# ↔ Rust multiplayer bridge)
+- Resolves `dc_multiplayer` exports from loaded module handle.
+- Calls Rust FFI functions for:
+  - room/session state
+  - save transfer status/data
+  - join/load transitions
+- Contains logic for:
+  - save discovery (`SaveSystem.saveDirPath`, fallback to `Application.persistentDataPath`)
+  - writing synchronized save payloads to disk
+  - backup (`.mp_backup`) and cleanup/restore (`CleanupMpSaveFiles`)
+  - deferred `SaveSystem.Load(...)` workflows after scene transitions.
 
-### Threading / Race Conditions
-- Rust-Relay nutzt separaten I/O-Thread (`thread::spawn`) + Kanal-Kommunikation (`mpsc`) in `crates/dc_multiplayer/src/net.rs`.
-- Shared Multiplayer-State ist über globalen `Mutex` gekapselt (`crates/dc_multiplayer/src/state.rs`).
-- Unity-API-Aufrufe finden überwiegend auf C#-Mainthread statt; Rust-I/O-Thread verarbeitet primär Netzwerk.
-- **Rest-Risiko**: Potenzielle Timing-/Lock-Contention-Szenarien bei hoher Last, aber keine offensichtliche direkte Unity-API-Nutzung aus Rust-Thread.
+#### `ModConfigSystem.cs` + `CustomEmployeeManager.cs`
+- Persists mod config JSON under:
+  - `MelonEnvironment.UserDataDirectory/ModConfigs`
+- Supports custom employee registration and mod asset management.
 
-## BEFUND: SICHERHEIT (Malware-Check)
+---
 
-### Dateioperationen außerhalb Spielverzeichnis
-- Runtime nutzt primär Game-Root/UserData.
-- `Application.persistentDataPath` kann systemweit (z. B. `%AppData%`) liegen; entspricht üblicher Unity-Speicherpraxis.
-- Keine Hinweise auf Zugriffe auf sensible Systempfade wie `System32`.
+### 1.3 Rust runtime flow (native side)
 
-### Netzwerk / Exfiltration
-- Sichtbarer Relay-Verkehr via WebSocket in `crates/dc_multiplayer/src/net.rs`.
-- Default-URL ist hart verdrahtet (`ws://192.99.16.77:9943`) in `crates/dc_multiplayer/src/state.rs`.
-- Kein zusätzlicher versteckter Telemetrie-/Webhook-Code in C#/Rust-Runtime gefunden.
+#### `dc_multiplayer`
+- Core shared state in `state.rs`:
+  - global `OnceLock<Mutex<MultiplayerState>>`
+  - default relay URL constant (`ws://192.99.16.77:9943`)
+  - session/save/carry/world sub-states
 
-### Shell-/Prozessausführung
-- Keine Runtime-Treffer für `System.Diagnostics.Process.Start` oder `std::process::Command`.
-- Vorhandene Download-/Installlogik in `tools/install.ps1` ist ein separates Setup-Skript, nicht Teil der Ingame-Runtime.
+#### Network loop (`net.rs`)
+- Establishes WebSocket connection using `tungstenite`.
+- Spawns dedicated I/O thread (`thread::spawn`).
+- Uses channels (`mpsc`) to pass packets/events between game thread and network thread.
+- Handles heartbeat and disconnection state transitions.
 
-### Sicherheitsbewertung
-- Kein direkter Malware-Befund.
-- Relevanter Security-Hinweis: Relay nutzt unverschlüsseltes `ws://` statt `wss://` (Man-in-the-Middle-/Manipulationsrisiko im Transit).
+#### Save FFI (`ffi/save.rs`)
+- Exposes C-callable functions consumed by C#:
+  - `mp_send_save_data`, `mp_get_save_data`, `mp_has_pending_save`, etc.
+- Uses pointer checks and bounded copies:
+  - null/length validation
+  - `copy_nonoverlapping` with `min(data.len(), max_len)`
 
-## HANDLUNGSEMPFEHLUNG
+#### Session FFI (`ffi/session.rs`)
+- Host/connect/disconnect and join-state export surface.
+- Converts C pointers into Rust slices/strings with explicit length handling.
 
-1. **Save-Sync härten**
-   - Atomic Write-Strategie und robustes Rollback für Multiplayer-Save-Overwrite ergänzen.
-   - Crash-resistente Marker/Recovery beim nächsten Start einbauen.
+#### `dc_netwatch`
+- Example automation mod; deploys portrait image into:
+  - `<game>/UserData/ModAssets`
+- Demonstrates gameplay automation and config-driven behavior, not system persistence.
 
-2. **Transport absichern**
-   - Relay auf **`wss://`** umstellen, Zertifikatsvalidierung sauber erzwingen.
-   - Optional Integritätsschutz auf Payload-Ebene (Signatur/MAC).
+---
 
-3. **FFI-Robustheit erhöhen**
-   - Klare FFI-Vertragsgrenzen dokumentieren (max Buffergrößen, Lebenszeiten).
-   - Defensive Guards/Telemetry für fehlerhafte Drittmods (Rate-Limits, Circuit-Breaker pro Mod).
+### 1.4 Cross-language logic trace (C# ↔ Rust)
 
-4. **Threading-Monitoring**
-   - Lock-Haltezeiten und Event-Queue-Latenzen messen (Debug-Metriken), um Race/Contention früh zu erkennen.
+1. C# runtime starts (`Core`), applies Harmony, loads native DLLs (`FFIBridge`).
+2. C# obtains function pointers from `dc_multiplayer` (`MultiplayerBridge.TryInitialize`).
+3. During host/join:
+   - C# requests/receives save data via Rust FFI.
+   - C# writes save payload to disk and invokes `SaveSystem.Load(...)`.
+4. Rust network thread receives relay messages, updates shared state, and surfaces events via FFI polling.
+5. C# periodic update loop consumes FFI state and drives Unity/game-side actions.
 
-5. **Persistenz minimieren**
-   - Alle mod-spezifischen Artefakte weiterhin strikt in UserData halten.
-   - Savegame-Formatkompatibilität ohne Mod removal-safe halten (keine irreversiblen Fremdfelder in Kernsave ohne Fallback).
+This creates a **hybrid runtime** where Unity logic remains C#-driven, while relay/session/save transport is Rust-driven.
+
+---
+
+## 2) POST-UNINSTALLATION DAMAGE ("LINGERING DAMAGE" REPORT)
+
+## 2.1 Savegame corruption and post-uninstall crash risk
+
+### Observed behavior
+- Multiplayer join/save-sync flow can:
+  - write `_mp_sync.*` temporary files,
+  - overwrite an existing save file with synchronized bytes,
+  - create backup as `original.save.mp_backup`,
+  - attempt restoration during cleanup.
+
+### Risk mechanism after uninstall
+- If the mod crashes or is force-terminated between overwrite and cleanup, the original save may remain replaced.
+- After uninstall, vanilla game loads whatever remains on disk:
+  - If replaced save is valid but unexpected: gameplay inconsistency.
+  - If structurally incompatible/corrupt: load failure or crash is possible.
+
+### Important nuance
+- The code does **not** show explicit custom field injection into game-native serializers from this audit path.
+- The main risk is **raw file replacement timing**, not guaranteed schema poisoning.
+
+**Assessment:** lingering damage risk is **real and moderate**, bounded to save data integrity/recovery behavior.
+
+---
+
+## 2.2 Permanent asset modification of base game files
+
+### Checked concern
+Whether runtime code overwrites:
+- `globalgamemanagers`
+- Unity `.assets`
+- original game assemblies/DLLs
+
+### Findings
+- No runtime evidence found of writing these base game files.
+- Harmony patching is in-memory/runtime interception.
+- File writes observed are in:
+  - game root log file
+  - `UserData` config/assets
+  - save directories (including `persistentDataPath` fallback)
+
+**Assessment:** no confirmed permanent base-asset tampering in audited runtime paths.
+
+---
+
+## 2.3 Orphaned configuration / registry / environment persistence
+
+### Findings
+- Mod config JSON persists in `UserData/ModConfigs`.
+- Optional mod assets persist in `UserData/ModAssets`.
+- No runtime code evidence of:
+  - Windows registry writes for persistence,
+  - environment variable mutation for persistence,
+  - startup task/service creation.
+
+### Post-uninstall behavior
+- Leftover config/assets may remain on disk and become stale/orphaned.
+- These are typically non-fatal unless external tooling or another mod expects specific schema.
+
+**Assessment:** lingering artifacts exist, but persistence is mainly file-level and user-removable.
+
+---
+
+## 3) ADDITIONAL SEVERE RISKS
+
+## 3.1 Hidden malicious behavior (exfiltration / RCE)
+
+### Exfiltration
+- Network traffic exists and is expected for multiplayer relay.
+- No hidden telemetry/webhook pipeline identified in audited runtime files.
+
+### Runtime code execution abuse
+- No direct runtime hits for:
+  - `System.Diagnostics.Process.Start`
+  - `std::process::Command`
+- Setup scripts under `tools/` are install-time utilities, not in-game runtime behavior.
+
+**Assessment:** no direct malware signature found in audited runtime paths.
+
+---
+
+## 3.2 Transport and trust risks
+
+- Default relay URL uses **unencrypted `ws://`**.
+- Risks:
+  - message sniffing,
+  - message tampering,
+  - replay/injection potential depending on server/client validation.
+
+**Severity:** high from a network-security standpoint, even without local malware intent.
+
+---
+
+## 3.3 FFI/system-level vulnerability surface
+
+- Native DLL loading from `Mods/native` implies trust in every loaded module.
+- Rust FFI methods include baseline pointer/size guards, but:
+  - malformed third-party native modules can still crash process,
+  - ABI mismatch or contract drift can destabilize game runtime.
+- Global mutexed state lowers data-race risk but may still encounter lock contention or logic races under high churn.
+
+**Assessment:** persistent OS compromise is not directly evidenced, but crash/availability risk is intrinsic to mixed managed/native mod ecosystems.
+
+---
+
+## Conclusive Risk Assessment
+
+## Final rating: **MEDIUM**
+
+### Why not LOW
+- Save overwrite/restore timing can leave broken saves after uninstall.
+- Plaintext relay transport (`ws://`) creates avoidable security exposure.
+- Native FFI boundaries are inherently crash-prone with untrusted modules.
+
+### Why not HIGH
+- No direct evidence of intentional malware behavior in runtime code.
+- No confirmed permanent modification of core game binaries/assets.
+- No confirmed registry/environment persistence abuse in runtime logic.
+
+---
+
+## Recommended Hardening Actions (Priority Ordered)
+
+1. **Eliminate save overwrite fragility**
+   - Use atomic temp-write + atomic rename where possible.
+   - Add crash-resilient journal/marker and startup recovery routine.
+   - Provide explicit "restore original save" command on next launch.
+
+2. **Upgrade transport security**
+   - Move relay to `wss://` with strict certificate validation.
+   - Add optional payload authentication (MAC/signature) to game messages.
+
+3. **Strengthen FFI contracts**
+   - Version and validate FFI ABI at startup.
+   - Enforce explicit max buffer sizes and return-code semantics.
+   - Isolate third-party native mod failures where feasible.
+
+4. **Reduce uninstall residue**
+   - Add optional cleanup routine for `_mp_*`, `.mp_backup`, and orphan mod artifacts.
+   - Document manual cleanup paths clearly for end users.
+
+5. **Operational safeguards**
+   - Add integrity checks/logging around save write/restore lifecycle.
+   - Monitor lock durations and event-queue latency in multiplayer hot paths.
